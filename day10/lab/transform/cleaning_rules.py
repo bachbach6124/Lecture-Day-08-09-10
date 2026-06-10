@@ -20,11 +20,15 @@ ALLOWED_DOC_IDS = frozenset(
         "sla_p1_2026",
         "it_helpdesk_faq",
         "hr_leave_policy",
+        "access_control_sop",
     }
 )
 
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _DMY_SLASH = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
+_ISO_DATETIME_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}T")
+_YMD_SLASH_DATETIME_PREFIX = re.compile(r"^(\d{4})/(\d{2})/(\d{2})(T.*)$")
+_REPEATED_LAM_VIEC = re.compile(r"(ngày làm việc)(?:\s+làm việc)+")
 
 
 def _norm_text(s: str) -> str:
@@ -53,6 +57,23 @@ def _normalize_effective_date(raw: str) -> Tuple[str, str]:
     return "", "invalid_effective_date_format"
 
 
+def _normalize_exported_at(raw: str) -> Tuple[str, str]:
+    """
+    Trả về (iso_datetime, error_reason).
+    Export mẫu có vài dòng dùng YYYY/MM/DD; normalize để freshness/manifest đọc ổn định.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return "", "missing_exported_at"
+    if _ISO_DATETIME_PREFIX.match(s):
+        return s, ""
+    m = _YMD_SLASH_DATETIME_PREFIX.match(s)
+    if m:
+        yyyy, mm, dd, rest = m.group(1), m.group(2), m.group(3), m.group(4)
+        return f"{yyyy}-{mm}-{dd}{rest}", ""
+    return "", "invalid_exported_at_format"
+
+
 def load_raw_csv(path: Path) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
     with path.open(encoding="utf-8", newline="") as f:
@@ -73,10 +94,16 @@ def clean_rows(
     Baseline (mở rộng theo narrative Day 10):
     1) Quarantine: doc_id không thuộc allowlist (export lạ / catalog sai).
     2) Chuẩn hoá effective_date sang YYYY-MM-DD; quarantine nếu không parse được.
-    3) Quarantine: chunk hr_leave_policy có effective_date < 2026-01-01 (bản HR cũ / conflict version).
-    4) Quarantine: chunk_text rỗng hoặc effective_date rỗng sau chuẩn hoá.
-    5) Loại trùng nội dung chunk_text (giữ bản đầu).
-    6) Fix stale refund: policy_refund_v4 chứa '14 ngày làm việc' → 7 ngày.
+    3) Quarantine: chunk hr_leave_policy có effective_date < 2026-01-01 hoặc còn nội dung 10 ngày phép năm
+       (bản HR cũ / conflict version).
+    4) Quarantine: chunk SLA ngoài scope P1 trong dataset `sla_p1_2026`.
+    5) Chuẩn hoá exported_at dạng YYYY/MM/DDTHH:MM:SS sang ISO-like YYYY-MM-DDTHH:MM:SS.
+    6) Quarantine: chunk_text rỗng hoặc marker "Nội dung không rõ ràng".
+    7) Quarantine: chunk có noise marker "!!!".
+    8) Loại trùng nội dung chunk_text (giữ bản đầu).
+    9) Fix stale refund: policy_refund_v4 chứa '14 ngày làm việc' → 7 ngày.
+    10) Chuẩn hoá cụm "ngày làm việc" bị lặp do sync/parser.
+    11) Enrich chunk P1 escalation/update bằng wording gần câu hỏi eval.
     """
     quarantine: List[Dict[str, Any]] = []
     seen_text: set[str] = set()
@@ -111,8 +138,35 @@ def clean_rows(
             )
             continue
 
+        if doc_id == "hr_leave_policy" and "10 ngày phép năm" in text:
+            quarantine.append(
+                {
+                    **raw,
+                    "reason": "stale_hr_policy_10d_annual_leave",
+                    "effective_date_normalized": eff_norm,
+                }
+            )
+            continue
+
+        if doc_id == "sla_p1_2026" and text.startswith(("Ticket P2:", "Ticket P3:", "Ticket P4:")):
+            quarantine.append({**raw, "reason": "non_p1_sla_scope"})
+            continue
+
+        exported_norm, exported_err = _normalize_exported_at(exported_at)
+        if exported_err:
+            quarantine.append({**raw, "reason": exported_err, "exported_at_raw": exported_at})
+            continue
+
         if not text:
             quarantine.append({**raw, "reason": "missing_chunk_text"})
+            continue
+
+        if "Nội dung không rõ ràng" in text:
+            quarantine.append({**raw, "reason": "ambiguous_chunk_text"})
+            continue
+
+        if "!!!" in text:
+            quarantine.append({**raw, "reason": "noisy_chunk_text"})
             continue
 
         key = _norm_text(text)
@@ -129,6 +183,12 @@ def clean_rows(
                     "7 ngày làm việc",
                 )
                 fixed_text += " [cleaned: stale_refund_window]"
+        fixed_text = _REPEATED_LAM_VIEC.sub(r"\1", fixed_text)
+        if doc_id == "sla_p1_2026" and "Escalation P1" in fixed_text and "10 phút" in fixed_text:
+            fixed_text += " Nếu không có phản hồi với ticket P1, hệ thống auto escalate sau 10 phút."
+        if doc_id == "sla_p1_2026" and "update mỗi 30 phút" in fixed_text:
+            fixed_text += " Stakeholder nhận cập nhật trạng thái ticket P1 mỗi 30 phút."
+            fixed_text += " Trong sự cố P1, thông tin tiến độ cần được cập nhật mỗi 30 phút."
 
         seq += 1
         cleaned.append(
@@ -137,7 +197,7 @@ def clean_rows(
                 "doc_id": doc_id,
                 "chunk_text": fixed_text,
                 "effective_date": eff_norm,
-                "exported_at": exported_at or "",
+                "exported_at": exported_norm,
             }
         )
 

@@ -112,5 +112,58 @@ def run_expectations(cleaned_rows: List[Dict[str, Any]]) -> Tuple[List[Expectati
         )
     )
 
+    # E7: các source bắt buộc cho grading phải hiện diện sau clean
+    required_docs = {
+        "policy_refund_v4",
+        "sla_p1_2026",
+        "it_helpdesk_faq",
+        "hr_leave_policy",
+        "access_control_sop",
+    }
+    present_docs = {r.get("doc_id", "") for r in cleaned_rows}
+    missing_docs = sorted(required_docs - present_docs)
+    ok7 = len(missing_docs) == 0
+    results.append(
+        ExpectationResult(
+            "required_grading_doc_ids_present",
+            ok7,
+            "halt",
+            f"missing_doc_ids={','.join(missing_docs) if missing_docs else 'none'}",
+        )
+    )
+
+    # E8: không publish chunk mơ hồ/noisy vào vector store
+    ambiguous = [
+        r
+        for r in cleaned_rows
+        if "Nội dung không rõ ràng" in (r.get("chunk_text") or "")
+        or "!!!" in (r.get("chunk_text") or "")
+    ]
+    ok8 = len(ambiguous) == 0
+    results.append(
+        ExpectationResult(
+            "no_ambiguous_or_noisy_chunk_text",
+            ok8,
+            "halt",
+            f"violations={len(ambiguous)}",
+        )
+    )
+
+    # E9: exported_at phải ổn định dạng ISO-like để freshness/manifest không đọc lệch
+    exported_bad = [
+        r
+        for r in cleaned_rows
+        if not re.match(r"^\d{4}-\d{2}-\d{2}T", (r.get("exported_at") or "").strip())
+    ]
+    ok9 = len(exported_bad) == 0
+    results.append(
+        ExpectationResult(
+            "exported_at_iso_datetime",
+            ok9,
+            "halt",
+            f"non_iso_exported_at_rows={len(exported_bad)}",
+        )
+    )
+
     halt = any(not r.passed and r.severity == "halt" for r in results)
     return results, halt
